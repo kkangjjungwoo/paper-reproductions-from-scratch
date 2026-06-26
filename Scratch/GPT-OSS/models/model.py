@@ -1,6 +1,7 @@
-from nt import device_encoding
-import torch
 import torch.nn as nn
+import torch
+import math
+from tying import Tuple
 
 
 class CustomTokenEmbedding(nn.Module):
@@ -87,3 +88,51 @@ class CustomRotaryEmbedding(nn.Module):
         self.ntk_alpha = ntk_alpha
         self.ntk_beta = ntk_beta
         self.device = device
+
+    def _compute_concentration_and_inv_freq(self) -> Tuple[float, torch.Tensor]:
+
+        freq = self.base ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32, device=self.device))/self.head_dim
+        
+        if self.scaling_factor > 1.0:
+            concentration = 0.1 * math.log(self.scaling_factor) + 1.0
+            d_half = self.head_dim / 2
+            low = (d_half * math.log(self.initial_context_length / (self.ntk_beta * 2 * math.pi)))/math.log(self.base)
+            high = (d_half * math.log(self.initial_context_length / (self.ntk_alpha * 2 * math.pi)))/math.log(self.base)
+
+            interpolation = 1.0 / (self.scaling_factor * freq)
+            extrapolation = 1.0 / freq
+            
+            ramp = (torch.arange(d_half, dtype = torch.float32, device=freq.device) - low) / (high - low)
+            mask = 1 - ramp.clamp(0,1)
+            inv_freq = interpolation * (1 - mask) + extrapolation * mask
+        else:
+            concentration = 1.0
+            inv_freq = 1.0 / freq
+        return concentration, inv_freq
+    def _compute_cos_sin(self, num_tokens: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        
+        concentration, inv_freq = self._compute_concentration_and_inv_freq()
+        positions = torch.arange(num_tokens, dtype=torch.float32, device=self.device)
+        freqs = torch.einsum("i,j->ij", positions, inv_freq)
+        cos = torch.cos(freqs) * concentration
+        sin = torch.sin(freqs) * concentration
+        return cos, sin
+    def forward(self, num_tokens: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        cos, sin = self._compute_cos_sin(num_tokens)
+        return cos.unsqueeze(0).to(self.dtype), sin.unsqueeze(0).to(self.dtype)
+    
+def apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    cos = cos.unsqueeze(-2).to(x.type)
+    sin = sin.unsqueeze(-2).to(x.type)
+
+    x1, x2 = torch.chunk(x, 2, dim=-1)
+
+    o1 = x1 * cos - x2 * sin
+    o2 = x2 * cos + x1 * sin
+
+    return torch.cat((o1, o2), dim = -1)
+
+
+
+            
+    
